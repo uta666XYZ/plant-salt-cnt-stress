@@ -1,0 +1,476 @@
+---
+title: "Salt × CNT priming in Barley and Cowpea"
+subtitle: "Synthetic-data demonstration of an analysis pipeline"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+    fig_width: 8
+    fig_height: 5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  dpi     = 110
+)
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(forcats)
+library(FactoMineR)
+library(factoextra)
+library(gridExtra)
+library(broom)
+library(knitr)
+
+theme_set(
+  theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      strip.background = element_rect(fill = "grey95", colour = NA),
+      legend.position  = "bottom"
+    )
+)
+
+dir.create("figures", showWarnings = FALSE)
+```
+
+## Background
+
+This is a **portfolio piece** demonstrating an analysis pipeline for a
+factorial plant stress-physiology experiment. The example scenario is a
+two-factor design — a NaCl salinity gradient crossed with a seed-priming
+treatment (labelled *CNT*) — measured in two crop species, **barley** and
+**cowpea**.
+
+**The data are fully synthetic** (`R/01_simulate_data.R`). The simulation
+encodes the qualitative phenotype the seed-priming literature
+reports:
+
+* NaCl monotonically suppresses germination and seedling growth and
+  inflates antioxidant enzymes (SOD, CAT, APX), MDA, proline and H₂O₂.
+* MWCNT priming (50 mg L⁻¹) partially rescues germination and growth and
+  lowers damage markers, while *further* up-regulating antioxidant
+  enzymes (priming hypothesis).
+* Cowpea is parameterised as more salt-sensitive than barley.
+
+The report layout: percentage germination →
+univariate seedling growth → ANOVA on growth → per-species PCA on the
+three growth indices (**barley**, **cowpea**), each shown as a
+correlation circle plus a treatment biplot.
+
+The point of the repo is not to discover anything — the effect is baked
+in — it is to demonstrate the **R analysis workflow**.
+
+```{r load}
+src <- "data/synthetic.csv"
+if (!file.exists(src)) source("R/01_simulate_data.R")
+
+df <- read.csv(src, stringsAsFactors = FALSE)
+df$nacl <- factor(df$nacl, levels = c(0, 50, 100, 150))
+df$cnt  <- factor(df$cnt,  levels = c("CNT-", "CNT+"))
+df$species <- factor(df$species, levels = c("Barley", "Cowpea"))
+
+dim(df)
+head(df)
+```
+
+`r nrow(df)` plants: 2 species × 4 NaCl levels × 2 CNT levels × 6 reps.
+
+## Percentage germination
+
+A separate seed-germination experiment (4 dishes × 25 seeds per
+treatment cell) covering an extended salt range (0 – 300 mM NaCl) to
+locate the tolerance limit for each species. Cumulative germination
+percentage is recorded daily from Day 0 to Day 4.
+
+```{r germ-load}
+src_g <- "data/germination.csv"
+if (!file.exists(src_g)) source("R/02_simulate_germination.R")
+
+germ <- read.csv(src_g, stringsAsFactors = FALSE)
+germ$nacl    <- factor(germ$nacl,
+                       levels = c(0, 50, 100, 150, 200, 300))
+germ$cnt     <- factor(germ$cnt,     levels = c("CNT-", "CNT+"))
+germ$species <- factor(germ$species, levels = c("Barley", "Cowpea"))
+
+germ_summary <- germ %>%
+  group_by(species, nacl, cnt, day) %>%
+  summarise(mean_pct = mean(germ_pct),
+            se_pct   = sd(germ_pct) / sqrt(n()),
+            .groups  = "drop")
+head(germ_summary)
+```
+
+```{r germ-plot, fig.width=10, fig.height=6}
+nacl_pal <- c(
+  "0"   = "#d62728",
+  "50"  = "#ff7f0e",
+  "100" = "#bcbd22",
+  "150" = "#2ca02c",
+  "200" = "#1f77b4",
+  "300" = "#e377c2"
+)
+
+p_germ <- ggplot(germ_summary,
+                 aes(x = day, y = mean_pct,
+                     colour = nacl, group = nacl)) +
+  geom_errorbar(aes(ymin = mean_pct - se_pct,
+                    ymax = mean_pct + se_pct),
+                width = 0.12, linewidth = 0.4) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.6) +
+  facet_grid(cnt ~ species) +
+  scale_colour_manual(values = nacl_pal, name = "NaCl (mM)") +
+  scale_y_continuous(limits = c(-2, 105),
+                     breaks = c(0, 25, 50, 75, 100)) +
+  labs(x = "Time (Day)", y = "Germination (%)") +
+  theme(legend.position = "right")
+
+p_germ
+ggsave("figures/germination_curves.png", p_germ,
+       width = 10, height = 6, dpi = 150, bg = "white")
+```
+
+Up to 150 mM NaCl, both species reach ~90 – 95 % germination by Day 2 –
+3. At 200 mM the curves plateau around 50 – 60 % (cowpea slightly lower
+than barley), and at 300 mM germination is essentially abolished.
+CNT+ panels show small but consistent upward shifts at the moderate-to-
+high salt levels — the priming effect on germination timing.
+
+## Univariate response: violin + box composite
+
+The headline figure: violin (full distribution shape) overlaid
+with a narrow boxplot (median + IQR), faceted by species, panelled by
+response variable.
+
+```{r violin, fig.width=10, fig.height=6}
+long <- df %>%
+  select(species, nacl, cnt,
+         shoot_length_cm, root_length_cm, fresh_weight_g) %>%
+  pivot_longer(-c(species, nacl, cnt),
+               names_to = "variable", values_to = "value")
+
+label_lookup <- c(
+  shoot_length_cm  = "Shoot length (cm)",
+  root_length_cm   = "Root length (cm)",
+  fresh_weight_g   = "Fresh weight (g)"
+)
+long$variable <- factor(long$variable,
+                        levels = names(label_lookup),
+                        labels = label_lookup)
+
+p_violin <- ggplot(long,
+       aes(x = nacl, y = value, fill = cnt)) +
+  geom_violin(position = position_dodge(0.8),
+              width = 0.85, alpha = 0.65, colour = NA, scale = "width") +
+  geom_boxplot(position = position_dodge(0.8),
+               width = 0.18, outlier.size = 0.6,
+               colour = "grey25", fill = "white", alpha = 0.9) +
+  facet_grid(variable ~ species, scales = "free_y", switch = "y") +
+  scale_fill_manual(values = c("CNT-" = "#94b8e2", "CNT+" = "#f0a868"),
+                    name = NULL) +
+  labs(x = "NaCl (mM)", y = NULL) +
+  theme(strip.placement = "outside",
+        strip.text.y.left = element_text(angle = 0, hjust = 1, size = 9),
+        panel.spacing.y = unit(0.4, "lines"))
+
+p_violin
+ggsave("figures/violin_panel.png", p_violin,
+       width = 10, height = 6, dpi = 150, bg = "white")
+```
+
+The signal is clear: growth falls with NaCl and the orange (CNT+)
+violins sit above the blue (CNT–) ones at high salt, with cowpea showing
+a steeper drop than barley.
+
+## ANOVA across all responses
+
+Three-way ANOVA `species × NaCl × CNT` on every measured response.
+The expected pattern: main effects of species, NaCl and CNT on growth;
+the same plus stronger NaCl effects on the stress markers; and a NaCl ×
+CNT interaction wherever CNT priming partially rescues (or amplifies)
+the NaCl effect.
+
+```{r anova-table}
+all_vars <- c(
+  "shoot_length_cm", "root_length_cm", "fresh_weight_g",
+  "shoot_root_axis_weight_mg",
+  "MDA_nmol_gFW", "H2O2_umol_gFW",
+  "SOD_U_mg", "CAT_U_mg", "APX_U_mg", "proline_umol_gFW"
+)
+
+stars <- function(p) {
+  ifelse(is.na(p), "",
+    ifelse(p < 0.001, "***",
+    ifelse(p < 0.01,  "**",
+    ifelse(p < 0.05,  "*",
+    ifelse(p < 0.10,  ".", "")))))
+}
+
+run_aov <- function(v) {
+  fit <- aov(reformulate("species * nacl * cnt", response = v),
+             data = df)
+  td  <- broom::tidy(fit)
+  td  <- td[td$term != "Residuals", ]
+  td$cell <- sprintf("F=%.1f%s",
+                     td$statistic, stars(td$p.value))
+  setNames(td$cell, td$term)
+}
+
+aov_mat <- t(sapply(all_vars, run_aov))
+aov_df  <- data.frame(Variable = rownames(aov_mat),
+                      aov_mat, check.names = FALSE,
+                      row.names = NULL)
+
+knitr::kable(aov_df,
+             caption = paste("Three-way ANOVA F-statistics",
+                             "(*** p<0.001, ** p<0.01, * p<0.05, . p<0.10)"))
+```
+
+Across all ten responses the NaCl main effect dominates (large F, ***).
+CNT main effects and the NaCl × CNT interaction are significant for
+growth and damage markers, consistent with priming. Species main effects
+appear mainly for growth (cowpea is parameterised as more salt-sensitive
+than barley).
+
+## Growth × biochemistry correlations
+
+Pearson correlations between the four growth indices and the six
+stress-response variables, computed on raw treatment-level data. A
+strong **negative** correlation between growth and damage markers (MDA,
+H₂O₂) and a strong **positive** correlation between growth and
+chlorophyll-replacement enzymes is expected; antioxidant enzymes are
+expected to track damage (positive with MDA/H₂O₂) since both rise under
+salt.
+
+```{r corr-heatmap, fig.width=9, fig.height=4.5}
+growth_set <- c("shoot_length_cm", "root_length_cm",
+                "fresh_weight_g", "shoot_root_axis_weight_mg")
+biochem_set <- c("SOD_U_mg", "CAT_U_mg", "APX_U_mg",
+                 "MDA_nmol_gFW", "proline_umol_gFW", "H2O2_umol_gFW")
+
+cor_mat <- cor(df[, c(growth_set, biochem_set)], method = "pearson")
+cor_long <- data.frame(
+  V1 = rep(rownames(cor_mat), times = ncol(cor_mat)),
+  V2 = rep(colnames(cor_mat), each = nrow(cor_mat)),
+  r  = as.vector(cor_mat),
+  stringsAsFactors = FALSE
+)
+
+# Restrict to growth (rows) × biochem (columns) panel + biochem × biochem
+short_lab <- c(
+  shoot_length_cm           = "Shoot length",
+  root_length_cm            = "Root length",
+  fresh_weight_g            = "Fresh weight",
+  shoot_root_axis_weight_mg = "Axis weight",
+  SOD_U_mg                  = "SOD", CAT_U_mg = "CAT",
+  APX_U_mg                  = "APX", MDA_nmol_gFW = "MDA",
+  proline_umol_gFW          = "Proline", H2O2_umol_gFW = "H2O2"
+)
+cor_long$V1 <- factor(short_lab[as.character(cor_long$V1)],
+                      levels = short_lab)
+cor_long$V2 <- factor(short_lab[as.character(cor_long$V2)],
+                      levels = rev(short_lab))
+
+p_corr <- ggplot(cor_long, aes(V1, V2, fill = r)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sprintf("%.2f", r)),
+            size = 3, colour = "grey15") +
+  scale_fill_gradient2(low = "#2166ac", mid = "white",
+                       high = "#b2182b", midpoint = 0,
+                       limits = c(-1, 1), name = "Pearson r") +
+  coord_fixed() +
+  labs(x = NULL, y = NULL,
+       title = "Pearson correlations: growth × biochemistry") +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1),
+        plot.title = element_text(face = "plain", size = 11),
+        panel.grid = element_blank())
+
+p_corr
+ggsave("figures/corr_heatmap.png", p_corr,
+       width = 9, height = 4.5, dpi = 150, bg = "white")
+```
+
+The expected priming-hypothesis pattern is visible: growth indices
+correlate strongly **negatively** with MDA, H₂O₂ and proline (more salt
+→ smaller plants and more damage), and strongly **positively** with
+each other; the antioxidant enzymes SOD, CAT and APX correlate
+positively with damage markers because both respond to NaCl. The four
+growth indices form a tight positive block, confirming that they are
+near-collinear and justifying the dimensionality reduction in the
+per-species PCAs that follow.
+
+## Multivariate response: per-species PCA
+
+One PCA per species on three
+**growth indices** — shoot length, root length, and shoot-root axis
+fresh weight. Each species gives a *correlation circle* showing which
+variables drive each axis, and a *treatment biplot* showing how the
+eight NaCl × CNT combinations separate in PC1–PC2 space.
+
+```{r pca-helper}
+growth_vars  <- c("shoot_length_cm", "root_length_cm",
+                  "shoot_root_axis_weight_mg")
+biochem_vars <- c("SOD_U_mg", "CAT_U_mg", "APX_U_mg",
+                  "MDA_nmol_gFW", "proline_umol_gFW", "H2O2_umol_gFW")
+
+run_species_pca <- function(species_name, vars = growth_vars) {
+  sub <- df[df$species == species_name, ]
+  res <- PCA(sub[, vars], scale.unit = TRUE,
+             graph = FALSE, ncp = 3)
+  list(sub = sub, res = res, eig = res$eig)
+}
+
+plot_treatment_biplot <- function(pca_obj, species_name) {
+  sub <- pca_obj$sub
+  res <- pca_obj$res
+  eig <- pca_obj$eig
+
+  ind <- as.data.frame(res$ind$coord[, 1:2])
+  names(ind) <- c("Dim1", "Dim2")
+  ind$nacl <- sub$nacl
+  ind$cnt  <- sub$cnt
+  ind$group <- interaction(sub$nacl, sub$cnt, sep = " / ",
+                           lex.order = TRUE)
+  levels(ind$group) <- gsub("^", "NaCl ", levels(ind$group))
+
+  vc <- as.data.frame(res$var$coord[, 1:2])
+  names(vc) <- c("Dim1", "Dim2")
+  scale_factor <- min(
+    diff(range(ind$Dim1)) / diff(range(vc$Dim1)),
+    diff(range(ind$Dim2)) / diff(range(vc$Dim2))
+  ) * 0.85
+  vc$Dim1s   <- vc$Dim1 * scale_factor
+  vc$Dim2s   <- vc$Dim2 * scale_factor
+  vc$varname <- rownames(vc)
+
+  pal <- RColorBrewer::brewer.pal(8, "Paired")
+
+  ggplot(ind, aes(Dim1, Dim2)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey70") +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey70") +
+    stat_ellipse(aes(colour = group, fill = group, linetype = cnt,
+                     group = group),
+                 geom = "polygon", alpha = 0.15, level = 0.68,
+                 linewidth = 0.6) +
+    geom_point(aes(colour = group, shape = cnt),
+               size = 2.2, alpha = 0.85) +
+    scale_colour_manual(values = pal, name = "Treatment") +
+    scale_fill_manual(values  = pal, name = "Treatment") +
+    scale_linetype_manual(values = c("CNT-" = "solid",
+                                     "CNT+" = "dashed"),
+                          name = NULL) +
+    scale_shape_manual(values = c("CNT-" = 16, "CNT+" = 17),
+                       name = NULL) +
+    guides(
+      colour   = guide_legend(override.aes = list(
+        linetype = rep(c("solid", "dashed"), 4),
+        shape    = rep(c(16, 17), 4)
+      )),
+      fill     = "none",
+      linetype = "none",
+      shape    = "none"
+    ) +
+    labs(title = species_name,
+         x = sprintf("PC1 (%.1f%%)", eig[1, 2]),
+         y = sprintf("PC2 (%.1f%%)", eig[2, 2])) +
+    theme(legend.position = "right",
+          plot.title = element_text(face = "plain", size = 12))
+}
+
+plot_var_circle <- function(pca_obj, species_name) {
+  eig <- pca_obj$eig
+  fviz_pca_var(pca_obj$res, axes = c(1, 2),
+               col.var = "contrib", repel = TRUE,
+               gradient.cols = c("#3b528b", "#f0a868", "#d62728")) +
+    labs(title = species_name,
+         x = sprintf("PC1 (%.1f%%)", eig[1, 2]),
+         y = sprintf("PC2 (%.1f%%)", eig[2, 2])) +
+    theme(plot.title = element_text(face = "plain", size = 12))
+}
+```
+
+### Barley and Cowpea
+
+```{r pca-both, fig.width=11, fig.height=9}
+pca_b <- run_species_pca("Barley")
+pca_c <- run_species_pca("Cowpea")
+
+cat("Barley eigenvalues:\n");  print(round(pca_b$eig[1:3, ], 2))
+cat("\nCowpea eigenvalues:\n"); print(round(pca_c$eig[1:3, ], 2))
+
+p_b_var <- plot_var_circle(pca_b,       "SS1: Barley — correlation circle")
+p_b_bip <- plot_treatment_biplot(pca_b, "SS1: Barley — treatment biplot")
+p_c_var <- plot_var_circle(pca_c,       "SS2: Cowpea — correlation circle")
+p_c_bip <- plot_treatment_biplot(pca_c, "SS2: Cowpea — treatment biplot")
+
+g <- gridExtra::arrangeGrob(p_b_var, p_b_bip,
+                            p_c_var, p_c_bip,
+                            ncol = 2, widths = c(1, 1.3))
+grid::grid.newpage(); grid::grid.draw(g)
+ggsave("figures/pca_ss1_ss2.png", g,
+       width = 11, height = 9, dpi = 150, bg = "white")
+```
+
+### Per-species PCA on biochemistry (SOD, CAT, APX, MDA, proline, H₂O₂)
+
+The same per-species PCA layout, this time on the six stress-response
+biochemistry variables. Whereas the growth-index PCA above separated
+treatments along a single salt-stress axis, the biochemistry PCA can
+distinguish the **direction** of the response — antioxidant enzymes
+(rising under both salt and CNT priming) versus damage markers (rising
+under salt but suppressed by CNT priming).
+
+```{r pca-both-biochem, fig.width=11, fig.height=9}
+pca_b2 <- run_species_pca("Barley", biochem_vars)
+pca_c2 <- run_species_pca("Cowpea", biochem_vars)
+
+cat("Barley biochem eigenvalues:\n");  print(round(pca_b2$eig[1:3, ], 2))
+cat("\nCowpea biochem eigenvalues:\n"); print(round(pca_c2$eig[1:3, ], 2))
+
+p_b2_var <- plot_var_circle(pca_b2,       "SS1: Barley — biochem correlation circle")
+p_b2_bip <- plot_treatment_biplot(pca_b2, "SS1: Barley — biochem treatment biplot")
+p_c2_var <- plot_var_circle(pca_c2,       "SS2: Cowpea — biochem correlation circle")
+p_c2_bip <- plot_treatment_biplot(pca_c2, "SS2: Cowpea — biochem treatment biplot")
+
+g2 <- gridExtra::arrangeGrob(p_b2_var, p_b2_bip,
+                             p_c2_var, p_c2_bip,
+                             ncol = 2, widths = c(1, 1.3))
+grid::grid.newpage(); grid::grid.draw(g2)
+ggsave("figures/pca_ss1_ss2_biochem.png", g2,
+       width = 11, height = 9, dpi = 150, bg = "white")
+```
+
+In the correlation circles, SOD, CAT and APX cluster together (they
+co-vary because all three rise under both salt and CNT priming), while
+MDA, H₂O₂ and proline form a partially distinct cluster — both groups
+load on PC1 (the salt axis) but separate on PC2, where the CNT-priming
+offset becomes visible. The treatment biplots show CNT+ ellipses
+shifted away from their CNT– partners on PC2 within each NaCl level,
+matching the priming hypothesis: at the same salt concentration, CNT+
+plants accumulate more antioxidant enzyme activity *and* less damage.
+
+In both species PC1 is the **salt-stress axis** (all three growth
+indices load together on one side; control treatments at PC1 > 0,
+150 mM NaCl at PC1 < 0). PC2 captures the residual within-treatment
+variation — including the CNT+ rescue offset, which is visible as a
+shift of the CNT+ ellipse away from its CNT– partner at the same NaCl
+level. Cowpea shows a wider PC1 spread than barley, consistent with
+its parameterised higher salt sensitivity.
+
+## Reproducibility
+
+```{r session, class.output="scroll"}
+sessionInfo()
+```
